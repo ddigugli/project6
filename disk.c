@@ -9,6 +9,7 @@ You should write all your code here.
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 //possible states for a flash page
 #define PAGE_FREE 0
@@ -48,7 +49,13 @@ Go ahead and add or change things here as needed.
 
 struct disk * disk_create( struct flash_drive *f, int disk_blocks )
 {
-	struct disk *d = malloc(sizeof(*d));
+	// Allocate memory for the disk structure
+    struct disk *d = malloc(sizeof(*d));
+    if (d == NULL) {
+        fprintf(stderr, "Memory allocation failed for disk structure\n");
+        return NULL;
+    }
+
 	d->flash_drive = f;
     d->disk_blocks = disk_blocks;
     d->flash_pages = flash_npages(f);
@@ -66,6 +73,7 @@ struct disk * disk_create( struct flash_drive *f, int disk_blocks )
         d->block_to_page[i] = -1;  // no mapping initially
     }
     
+    // page metadata: no reverse mapping, all pages free
     for (int i = 0; i < d->flash_pages; i++) {
         d->page_to_block[i] = -1;  // no reverse mapping initially
         d->page_status[i] = PAGE_FREE;
@@ -94,13 +102,31 @@ int disk_read( struct disk *d, int disk_block, char *data )
     }
     
     int flash_page = d->block_to_page[disk_block];
+    printf("  [Mapping] disk_block %d -> flash_page %d\n", disk_block, flash_page);
     
     if (flash_page < 0) {
         //block has never been written, return zeros
+        printf("  [Info] Block %d has not been written yet. Returning zeros.\n", disk_block);
         memset(data, 0, DISK_BLOCK_SIZE);
     } else {
+        int status = d->page_status[flash_page];
+        int mapped_block = d->page_to_block[flash_page];
+
+        // Sanity check: verify page is valid and points to correct block
+        if (status != PAGE_VALID || mapped_block != disk_block) {
+            fprintf(stderr, "  ERROR: Invalid mapping! flash_page %d has status=%d, maps to disk block %d (expected %d)\n",
+                    flash_page, status, mapped_block, disk_block);
+            memset(data, 0, DISK_BLOCK_SIZE);  // Fallback
+            return -1;
+        }
         // read the data from the mapped flash page
+        printf("  [Action] Reading from flash page %d\n", flash_page);
         flash_read(d->flash_drive, flash_page, data);
+        printf("  [Debug] First 8 bytes of read data: ");
+        for (int i = 0; i < 8; i++) {
+            printf("%02x ", (unsigned char)data[i]);
+        }
+        printf("\n");
     }
 
 	d->nreads++;
@@ -121,53 +147,58 @@ int disk_write( struct disk *d, int disk_block, const char *data )
         return -1;
     }
     
-    // if there's an existing mapping, invalidate the old page
-    int old_page = d->block_to_page[disk_block];
-    if (old_page >= 0) {
-        d->page_status[old_page] = PAGE_INVALID;
-        d->page_to_block[old_page] = -1; // reverse mapping
-    }
-    
     //find a free page to write the data
     int new_page = find_free_page(d, -1);
-    
-    // if no free pages, we need to clean (garbage collect) a block
+    printf("  [Find] Initial free page search result: %d\n", new_page);
+
+    // GC if needed
     if (new_page < 0) {
         int block_to_clean = select_block_to_clean(d);
         if (block_to_clean >= 0) {
+            printf("  [GC] Cleaning block %d\n", block_to_clean);
             clean_block(d, block_to_clean);
-            //try to find a free page again
             new_page = find_free_page(d, block_to_clean);
         }
-        
-        // if still no free pages, we need to clean more blocks
-        if (new_page < 0) {
-            // choose the block with lowest erase count for wear leveling
-            int min_count = d->erase_count[0];
-            int min_block = 0;
-            
-            for (int i = 1; i < d->flash_blocks; i++) {
-                if (d->erase_count[i] < min_count) {
-                    min_count = d->erase_count[i];
-                    min_block = i;
-                }
+    }
+
+    // Wear-leveling fallback
+    if (new_page < 0) {
+        int min_block = 0, min_count = d->erase_count[0];
+        for (int i = 1; i < d->flash_blocks; i++) {
+            if (d->erase_count[i] < min_count) {
+                min_count = d->erase_count[i];
+                min_block = i;
             }
-            
-            clean_block(d, min_block);
-            new_page = find_free_page(d, min_block);
         }
+        printf("  [WearLeveling] Cleaning block %d with lowest erase count %d\n", min_block, min_count);
+        clean_block(d, min_block);
+        new_page = find_free_page(d, min_block);
     }
     
-    // write the data to the new page
+    if (new_page < 0) {
+        // fprintf(stderr, "  ERROR: No free page available even after GC!\n");
+        return -1;
+    }
+
+    int old_page = d->block_to_page[disk_block];
+    if (old_page >= 0) {
+        d->page_status[old_page] = PAGE_INVALID;
+        d->page_to_block[old_page] = -1;
+    }
+
+    // Step 2: write new data
     flash_write(d->flash_drive, new_page, data);
-    
-    //update the mapping
+    printf("  [Write] Writing data to flash page %d for disk_block %d\n", new_page, disk_block);
+
+
+
+    // Step 3: update mapping
     d->block_to_page[disk_block] = new_page;
     d->page_to_block[new_page] = disk_block;
     d->page_status[new_page] = PAGE_VALID;
 
-	d->nwrites++;
-	return 0;
+    d->nwrites++;
+    return 0;
 }
 
 /*
@@ -181,7 +212,6 @@ void disk_report( struct disk *d )
 	printf("\tdisk writes: %d\n",d->nwrites);
 
 	//free alloc mem
-
 	free(d->block_to_page);
     free(d->page_to_block);
     free(d->page_status);
@@ -191,87 +221,107 @@ void disk_report( struct disk *d )
 
 //clean a blk by moving valid pages and erasing
 void clean_block(struct disk *d, int block_num) {
+
     int block_start = block_num * d->pages_per_block;
-    char buffer[DISK_BLOCK_SIZE];
+    // char buffer[DISK_BLOCK_SIZE];
+    printf("\n[clean_block] Cleaning block %d\n", block_num);
     
-    // mv valid pages to new locations
+    // Step 1: Record valid page info before erase
+    struct {
+        int page_num;
+        int disk_block;
+        char data[DISK_BLOCK_SIZE];  
+    } valid_pages[d->pages_per_block];
+    int valid_count = 0;
+
     for (int p = 0; p < d->pages_per_block; p++) {
         int page_num = block_start + p;
-        
+
         if (d->page_status[page_num] == PAGE_VALID) {
-            // find the disk block that maps to this page
             int disk_block = d->page_to_block[page_num];
-            
             if (disk_block >= 0) {
-                // only migrate if this page is still the current one
-                if (d->block_to_page[disk_block] != page_num) continue;
+                flash_read(d->flash_drive, page_num, valid_pages[valid_count].data); 
+                valid_pages[valid_count].page_num = page_num;
+                valid_pages[valid_count].disk_block = disk_block;
+                valid_count++;
+                printf("  [Migrate] Valid page %d still mapped to disk block %d\n", page_num, disk_block);
+            }
+        }
+    }
+
+    // Step 2: Erase the block first
+    for (int p = 0; p < d->pages_per_block; p++) {
+        int page_num = block_start + p;
+        d->page_status[page_num] = PAGE_INVALID;
+        d->page_to_block[page_num] = -1;
+    }
+    flash_erase(d->flash_drive, block_num);
+    d->erase_count[block_num]++;
+    printf("  [Erase] Block %d erased (erase count now %d)\n", block_num, d->erase_count[block_num]);
+
+
+    for (int p = 0; p < d->pages_per_block; p++) {
+        int page_num = block_start + p;
+        d->page_status[page_num] = PAGE_FREE;
+        d->page_to_block[page_num] = -1;
+    }
+
+    // Step 3: Migrate valid pages to now-free pages in this block or others
+    for (int i = 0; i < valid_count; i++) {
+        int old_page = valid_pages[i].page_num;
+        int disk_block = valid_pages[i].disk_block;
+
+        int new_page = find_free_page(d, -1); // Allow using this block now
+        if (new_page >= 0) {
+            flash_write(d->flash_drive, new_page, valid_pages[i].data);
+
+            d->block_to_page[disk_block] = new_page;
+            d->page_to_block[new_page] = disk_block;
+            d->page_status[new_page] = PAGE_VALID;
+
+            printf("  [Remap] disk_block %d moved from old page %d to new page %d\n",
+                disk_block, old_page, new_page);
             
-                flash_read(d->flash_drive, page_num, buffer);
-                
-                int new_page = find_free_page(d, block_num);
-                if (new_page >= 0) {
-                    flash_write(d->flash_drive, new_page, buffer);
-                    
-                    // updaye mappings
-                    d->block_to_page[disk_block] = new_page;
-                    d->page_to_block[new_page] = disk_block;
-                    d->page_status[new_page] = PAGE_VALID;
+        } else {
+            fprintf(stderr, "  ERROR: No free page available during cleaning (post-erase)!\n");
+        }
+    }
+}
+
+
+
+// find a free page for writing
+int find_free_page(struct disk *d, int avoid_block) {
+    if (d->flash_blocks == 0 || d->pages_per_block == 0) {
+        fprintf(stderr, "ERROR: Invalid disk configuration (0 blocks or pages).\n");
+        return -1;
+    }
+
+    int best_page = -1;
+    int lowest_erase = INT_MAX;
+
+    // Iterate over all flash blocks
+    for (int b = 0; b < d->flash_blocks; b++) {
+        if (b == avoid_block) continue;  // Skip the block to avoid
+
+        int block_start = b * d->pages_per_block;
+
+        // Iterate over all pages in the block
+        for (int p = 0; p < d->pages_per_block; p++) {
+            int page = block_start + p;
+
+            // Check if the page is free
+            if (d->page_status[page] == PAGE_FREE) {
+                // Track the block with the lowest erase count
+                if (d->erase_count[b] < lowest_erase) {
+                    lowest_erase = d->erase_count[b];
+                    best_page = page;
                 }
             }
         }
     }
-    
-    //erase the block
-    flash_erase(d->flash_drive, block_num);
-    d->erase_count[block_num]++;
-    
-    // mark all pages in this block as free
-    for (int p = 0; p < d->pages_per_block; p++) {
-        int page_num = block_start + p;
-        d->page_status[page_num] = PAGE_FREE;
-        d->page_to_block[page_num] = -1; // reverse mapping
-    }
-}
 
-// find a free page for writing
-int find_free_page(struct disk *d, int avoid_block) {
-    // first try to find a block with the lowest erase count
-    int lowest_erase = d->erase_count[0];
-    int best_block = 0;
-    
-    for (int i = 1; i < d->flash_blocks; i++) {
-        // skip the block were trying to avoid
-        if (i == avoid_block) continue;
-        
-        if (d->erase_count[i] < lowest_erase) {
-            lowest_erase = d->erase_count[i];
-            best_block = i;
-        }
-    }
-    
-    // try block with lowest erase count first
-    int start_page = best_block * d->pages_per_block;
-    for (int i = 0; i < d->pages_per_block; i++) {
-        if (d->page_status[start_page + i] == PAGE_FREE) {
-            return start_page + i;
-        }
-    }
-    
-    // if block full, check all blocks
-    for (int b = 0; b < d->flash_blocks; b++) {
-        // skip the avoided block and the one we already checked
-        if (b == avoid_block || b == best_block) continue;
-        
-        int block_start = b * d->pages_per_block;
-        for (int p = 0; p < d->pages_per_block; p++) {
-            if (d->page_status[block_start + p] == PAGE_FREE) {
-                return block_start + p;
-            }
-        }
-    }
-    
-    // no free pages 
-    return -1;
+    return best_page;  // -1 if no free pages found
 }
 
 //find blk to clean
