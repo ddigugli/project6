@@ -33,7 +33,6 @@ struct disk {
 	int *page_status; //status of each flash page
 	int *erase_count; //count of erases for each flash block
 
-	int next_free_page; //next free page for writing
 	int nreads;
 	int nwrites;
 };

@@ -1,7 +1,7 @@
 OPTIONS=--std=c99 -Wall -g
 
 flashsim: main.o disk.o flash.o
-	gcc main.o disk.o flash.o -o flashsim
+	gcc main.o disk.o flash.o -o flashsim -Wall
 
 main.o: main.c disk.h flash.h
 	gcc ${OPTIONS} -c main.c -o main.o
